@@ -130,15 +130,23 @@ function nextActive(from, fins, total = 4) {
 // ─── TURN TIMER ─────────────────────────────────────────────────────────
 const TURN_TIMEOUT = 30000;
 
+function clearTurnTimer(room) {
+  if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
+  if (room.botTimer)  { clearTimeout(room.botTimer);  room.botTimer  = null; }
+  room.turnDeadline = null;
+}
+
 function startTurnTimer(room) {
   clearTurnTimer(room);
   room.turnDeadline = Date.now() + TURN_TIMEOUT;
   room.turnTimer = setTimeout(() => autoPass(room), TURN_TIMEOUT);
 }
 
-function clearTurnTimer(room) {
-  if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
-  room.turnDeadline = null;
+// After every turn change: start timer + schedule bot if needed
+function afterTurnChange(room) {
+  startTurnTimer(room);
+  const cp = room.players[room.currentPlayer];
+  if (cp?.isBot && room.phase === 'playing') scheduleBot(room);
 }
 
 function autoPass(room) {
@@ -152,18 +160,105 @@ function autoPass(room) {
     const needed = active.filter(i => i !== room.table.playedBy).length;
     room.currentPlayer = nextActive(seatIdx, room.finished);
     room.log.push(`${p.name} пасует (авто)`);
-    if (room.passStreak >= needed) {
-      room.table = null;
-      room.passStreak = 0;
-      room.log.push('— Стол очищен —');
-    }
+    if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
   } else {
     room.currentPlayer = nextActive(seatIdx, room.finished);
     room.log.push(`${p.name} пропускает ход (авто)`);
   }
   room.log = room.log.slice(-12);
   broadcastRoom(room);
-  startTurnTimer(room);
+  afterTurnChange(room);
+}
+
+// ─── BOT LOGIC ─────────────────────────────────────────────────────────
+const BOT_NAMES = ['Алибек 🤖', 'Даурен 🤖', 'Санжар 🤖'];
+
+function scheduleBot(room) {
+  if (room.botTimer) return; // already scheduled
+  const seatIdx = room.currentPlayer;
+  const p = room.players[seatIdx];
+  if (!p?.isBot || room.phase !== 'playing') return;
+
+  room.botTimer = setTimeout(() => {
+    room.botTimer = null;
+    if (room.phase !== 'playing' || room.currentPlayer !== seatIdx) return;
+
+    const hand = room.hands[seatIdx];
+    if (!hand?.length) return;
+
+    if (!room.table) {
+      // Play lowest single card
+      const card = hand[0];
+      const combo = detectCombo([card]);
+      if (!combo) return;
+      room.hands[seatIdx] = hand.filter(c => c.id !== card.id);
+      room.table = { cards: [card], combo, playedBy: seatIdx };
+      room.log.push(`${p.name}: 1к`);
+      if (room.hands[seatIdx].length === 0) {
+        room.finished.push(seatIdx);
+        room.log.push(`${p.name} вышел`);
+        const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+        if (active.length <= 1) {
+          room.phase = 'finished';
+          room.log.push('🏆 Партия окончена!');
+          if (room.finished.length > 0) room.wins[room.finished[0]]++;
+          clearTurnTimer(room);
+          broadcastRoom(room);
+          return;
+        }
+      }
+      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.passStreak = 0;
+      room.log = room.log.slice(-12);
+      broadcastRoom(room);
+      afterTurnChange(room);
+    } else if (room.table.playedBy !== seatIdx) {
+      // Try to beat with a pair if possible, else pass
+      let played = false;
+      const rankNeeded = room.table.combo.rank;
+      if (room.table.combo.type === 'single') {
+        const candidate = hand.find(c => (VR[c.value] ?? -1) > rankNeeded && c.type === 'regular');
+        if (candidate) {
+          const combo = detectCombo([candidate]);
+          if (combo && canBeat(combo, room.table.combo)) {
+            room.hands[seatIdx] = hand.filter(c => c.id !== candidate.id);
+            room.table = { cards: [candidate], combo, playedBy: seatIdx };
+            room.log.push(`${p.name}: 1к`);
+            if (room.hands[seatIdx].length === 0) {
+              room.finished.push(seatIdx);
+              const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+              if (active.length <= 1) {
+                room.phase = 'finished';
+                room.log.push('🏆 Партия окончена!');
+                if (room.finished.length > 0) room.wins[room.finished[0]]++;
+                clearTurnTimer(room);
+                broadcastRoom(room);
+                return;
+              }
+            }
+            room.currentPlayer = nextActive(seatIdx, room.finished);
+            room.passStreak = 0;
+            room.log = room.log.slice(-12);
+            broadcastRoom(room);
+            afterTurnChange(room);
+            played = true;
+          }
+        }
+      }
+      if (!played) {
+        // Pass
+        room.log.push(`${p.name} пасует`);
+        room.passStreak++;
+        const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+        const needed = active.filter(i => i !== room.table.playedBy).length;
+        room.currentPlayer = nextActive(seatIdx, room.finished);
+        if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
+        room.log = room.log.slice(-12);
+        broadcastRoom(room);
+        afterTurnChange(room);
+      }
+    }
+  }, 1200 + Math.random() * 800);
 }
 
 // ─── ROOMS ─────────────────────────────────────────────────────────────
@@ -178,9 +273,8 @@ function scheduleSave() {
   saveTimeout = setTimeout(() => {
     try {
       const data = {};
-      for (const [code, room] of Object.entries(rooms)) {
-        data[code] = { ...room, turnTimer: undefined };
-      }
+      for (const [code, room] of Object.entries(rooms))
+        data[code] = { ...room, turnTimer: undefined, botTimer: undefined };
       fs.writeFileSync(ROOMS_FILE, JSON.stringify(data));
     } catch(e) { console.log('Save error:', e.message); }
   }, 1000);
@@ -191,7 +285,7 @@ function loadRooms() {
     if (!fs.existsSync(ROOMS_FILE)) return;
     const data = JSON.parse(fs.readFileSync(ROOMS_FILE, 'utf8'));
     for (const [code, room] of Object.entries(data)) {
-      room.turnTimer = null;
+      room.turnTimer = null; room.botTimer = null;
       rooms[code] = room;
       if (room.phase === 'playing') {
         if (room.turnDeadline && room.turnDeadline > Date.now()) {
@@ -200,6 +294,8 @@ function loadRooms() {
         } else {
           setTimeout(() => autoPass(room), 500);
         }
+        const cp = room.players[room.currentPlayer];
+        if (cp?.isBot) scheduleBot(room);
       }
     }
     console.log(`Loaded ${Object.keys(data).length} room(s) from backup`);
@@ -227,6 +323,7 @@ function getPublicState(room, forPlayerId) {
       seatIndex: i,
       connected: p.connected !== false,
       wins: room.wins?.[i] || 0,
+      isBot: p.isBot || false,
     })),
     table: room.table,
     log: room.log,
@@ -242,9 +339,7 @@ function getPublicState(room, forPlayerId) {
 
 function broadcastRoom(room) {
   room.players.forEach(p => {
-    if (p.socketId) {
-      io.to(p.socketId).emit('gameState', getPublicState(room, p.id));
-    }
+    if (p.socketId) io.to(p.socketId).emit('gameState', getPublicState(room, p.id));
   });
   scheduleSave();
 }
@@ -254,9 +349,7 @@ function startGame(room) {
   const hands = [[], [], [], []];
   deck.forEach((c, i) => hands[i % 4].push(c));
   let first = 0;
-  for (let i = 0; i < 4; i++) {
-    if (hands[i].some(c => c.isSpade4)) { first = i; break; }
-  }
+  for (let i = 0; i < 4; i++) { if (hands[i].some(c => c.isSpade4)) { first = i; break; } }
   room.hands = hands;
   room.currentPlayer = first;
   room.table = null;
@@ -264,7 +357,7 @@ function startGame(room) {
   room.passStreak = 0;
   room.phase = 'playing';
   room.log = [`${room.players[first].name} ходит первым (4♠)`];
-  startTurnTimer(room);
+  afterTurnChange(room);
 }
 
 // ─── SOCKET EVENTS ─────────────────────────────────────────────────────────
@@ -274,19 +367,11 @@ io.on('connection', (socket) => {
   socket.on('createRoom', ({ playerName }) => {
     const code = generateCode();
     const room = {
-      code,
-      phase: 'waiting',
+      code, phase: 'waiting',
       players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', connected: true }],
-      hands: [[], [], [], []],
-      levels: [0, 0, 0, 0],
-      wins: [0, 0, 0, 0],
-      currentPlayer: 0,
-      table: null,
-      log: [],
-      finished: [],
-      passStreak: 0,
-      turnDeadline: null,
-      turnTimer: null,
+      hands: [[], [], [], []], levels: [0,0,0,0], wins: [0,0,0,0],
+      currentPlayer: 0, table: null, log: [], finished: [], passStreak: 0,
+      turnDeadline: null, turnTimer: null, botTimer: null,
     };
     rooms[code] = room;
     socket.join(code);
@@ -300,13 +385,23 @@ io.on('connection', (socket) => {
     if (room.phase !== 'waiting') { socket.emit('error', 'Игра уже началась'); return; }
     if (room.players.length >= 4) { socket.emit('error', 'Комната заполнена'); return; }
     const seatIdx = room.players.length;
-    room.players.push({ id: socket.id, socketId: socket.id, name: playerName || `Игрок ${seatIdx + 1}`, connected: true });
+    room.players.push({ id: socket.id, socketId: socket.id, name: playerName || `Игрок ${seatIdx+1}`, connected: true });
     socket.join(code.toUpperCase());
     broadcastRoom(room);
-    if (room.players.length === 4) {
-      startGame(room);
-      broadcastRoom(room);
+    if (room.players.length === 4) { startGame(room); broadcastRoom(room); }
+  });
+
+  socket.on('fillWithBots', ({ code }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== 'waiting') return;
+    if (room.players[0]?.socketId !== socket.id) return;
+    let bi = 0;
+    while (room.players.length < 4) {
+      room.players.push({ id: `bot_${Date.now()}_${bi}`, socketId: null, name: BOT_NAMES[bi] || `Бот ${bi+1}`, connected: true, isBot: true });
+      bi++;
     }
+    startGame(room);
+    broadcastRoom(room);
   });
 
   socket.on('rejoinRoom', ({ code, playerId }) => {
@@ -314,8 +409,7 @@ io.on('connection', (socket) => {
     if (!room) { socket.emit('error', 'Комната не найдена'); return; }
     const p = room.players.find(p => p.id === playerId);
     if (p) {
-      p.socketId = socket.id;
-      p.connected = true;
+      p.socketId = socket.id; p.connected = true;
       socket.join(code);
       room.log.push(`${p.name} переподключился`);
       room.log = room.log.slice(-12);
@@ -343,27 +437,16 @@ io.on('connection', (socket) => {
       room.finished.push(seatIdx);
       const is44 = combo.type === 'pair' && selected.every(c => rvOf(c, chamVal) === '4');
       if (is44) {
-        if (room.levels[seatIdx] === 0) {
-          room.levels[seatIdx] = 2;
-          room.log.push(`${pname} вышел с 4-4! → уровень 6`);
-        } else {
-          [0,1,2,3].forEach(i => { if (i !== seatIdx && !room.finished.includes(i)) room.levels[i] = Math.max(0, room.levels[i] - 1); });
-          room.log.push(`${pname} вышел с 4-4! Все -1 уровень`);
-        }
+        if (room.levels[seatIdx] === 0) { room.levels[seatIdx] = 2; room.log.push(`${pname} вышел с 4-4! → уровень 6`); }
+        else { [0,1,2,3].forEach(i => { if (i !== seatIdx && !room.finished.includes(i)) room.levels[i] = Math.max(0, room.levels[i]-1); }); room.log.push(`${pname} вышел с 4-4! Все -1 уровень`); }
       } else {
         const hasLv = selected.some(c => rvOf(c, chamVal) === getLV(room.levels[seatIdx]));
-        if (hasLv) {
-          const oldLv = getLV(room.levels[seatIdx]);
-          room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type);
-          room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`);
-        } else {
-          room.log.push(`${pname} вышел (уровень без изменений)`);
-        }
+        if (hasLv) { const oldLv = getLV(room.levels[seatIdx]); room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type); room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`); }
+        else room.log.push(`${pname} вышел (уровень без изменений)`);
       }
       const active = [0,1,2,3].filter(i => !room.finished.includes(i));
       if (active.length <= 1) {
-        room.phase = 'finished';
-        room.log.push('🏆 Партия окончена!');
+        room.phase = 'finished'; room.log.push('🏆 Партия окончена!');
         if (room.finished.length > 0) room.wins[room.finished[0]]++;
         clearTurnTimer(room);
       }
@@ -371,19 +454,15 @@ io.on('connection', (socket) => {
       const myLV = getLV(room.levels[seatIdx]);
       if (selected.some(c => rvOf(c, chamVal) === myLV)) {
         const left = room.hands[seatIdx].filter(c => c.value === myLV && c.type === 'regular').length;
-        if (left === 0) {
-          room.levels[seatIdx] = Math.max(0, room.levels[seatIdx] - 1);
-          room.log.push(`${pname} потратил все ${myLV}! -1 уровень`);
-        }
+        if (left === 0) { room.levels[seatIdx] = Math.max(0, room.levels[seatIdx]-1); room.log.push(`${pname} потратил все ${myLV}! -1 уровень`); }
       }
       room.log.push(`${pname}: ${selected.length}к`);
     }
-
     room.table = { cards: selected, combo, playedBy: seatIdx };
     room.currentPlayer = nextActive(seatIdx, room.finished);
     room.passStreak = 0;
     room.log = room.log.slice(-12);
-    if (room.phase === 'playing') startTurnTimer(room);
+    if (room.phase === 'playing') afterTurnChange(room);
     broadcastRoom(room);
   });
 
@@ -400,7 +479,7 @@ io.on('connection', (socket) => {
     room.currentPlayer = nextActive(seatIdx, room.finished);
     if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
     room.log = room.log.slice(-12);
-    startTurnTimer(room);
+    afterTurnChange(room);
     broadcastRoom(room);
   });
 
