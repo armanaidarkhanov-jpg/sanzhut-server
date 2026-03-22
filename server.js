@@ -13,16 +13,17 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// ─── GAME LOGIC ─────────────────────────────────────────────────────────
+// ─── GAME LOGIC ───────────────────────────────────────────────────────────────────────────────────────
 const SUITS    = ['♠','♥','♦','♣'];
 const REG_VALS = ['4','5','6','7','8','9','10','J','Q','K','A','2','3'];
 const SEQ_BAD  = new Set(['2','3','JB','JR']);
 const VR = {};
 REG_VALS.forEach((v,i) => VR[v] = i);
 VR['JB'] = 13; VR['JR'] = 14;
+const MAX_LEVEL = REG_VALS.length - 1; // index 12 = '3'
 
-const getLV  = idx => REG_VALS[Math.max(0, Math.min(idx, REG_VALS.length-1))];
-const advLV  = (idx, ct) => Math.min(idx + ({single:1,pair:2,small_bomb:3,big_bomb:4}[ct]||0), REG_VALS.length-1);
+const getLV  = idx => REG_VALS[Math.max(0, Math.min(idx, MAX_LEVEL))];
+const advLV  = (idx, ct) => Math.min(idx + ({single:1,pair:2,small_bomb:3,big_bomb:4}[ct]||0), MAX_LEVEL);
 const rvOf   = (c, cv) => c.type === 'chameleon' ? (cv || '4') : c.value;
 
 function createDeck() {
@@ -127,7 +128,35 @@ function nextActive(from, fins, total = 4) {
   return n;
 }
 
-// ─── TURN TIMER ─────────────────────────────────────────────────────────
+// ─── ROUND END HELPER ─────────────────────────────────────────────────────────────────────────────────
+// Returns true if the round/session ended.
+// Should be called after room.finished.push(seatIdx) and level advancement.
+function checkRoundEnd(room) {
+  const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+  // Check champion: anyone reached max level?
+  if (!room.champion) {
+    const champIdx = room.levels.findIndex(l => l >= MAX_LEVEL);
+    if (champIdx !== -1) {
+      room.champion = champIdx;
+      room.wins[champIdx] = (room.wins[champIdx] || 0) + 1;
+      room.log.push(`🏆 ${room.players[champIdx]?.name} — ЧЕМПИОН СЕССИИ!`);
+      room.phase = 'finished';
+      clearTurnTimer(room);
+      return true;
+    }
+  }
+  // Normal round end: only one active player left
+  if (active.length <= 1) {
+    if (!room.champion && room.finished.length > 0) room.wins[room.finished[0]]++;
+    room.log.push('🏆 Партия окончена!');
+    room.phase = 'finished';
+    clearTurnTimer(room);
+    return true;
+  }
+  return false;
+}
+
+// ─── TURN TIMER ─────────────────────────────────────────────────────────────────────────────────────────
 const TURN_TIMEOUT = 30000;
 
 function clearTurnTimer(room) {
@@ -162,6 +191,10 @@ function autoPass(room) {
     room.log.push(`${p.name} пасует (авто)`);
     if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
   } else {
+    // Owns table or no table: just advance (table owner case = everyone passed)
+    if (room.table && room.table.playedBy === seatIdx) {
+      room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —');
+    }
     room.currentPlayer = nextActive(seatIdx, room.finished);
     room.log.push(`${p.name} пропускает ход (авто)`);
   }
@@ -170,11 +203,11 @@ function autoPass(room) {
   afterTurnChange(room);
 }
 
-// ─── BOT LOGIC ─────────────────────────────────────────────────────────
+// ─── BOT LOGIC ──────────────────────────────────────────────────────────────────────────────────────────
 const BOT_NAMES = ['Алибек 🤖', 'Даурен 🤖', 'Санжар 🤖'];
 
 function scheduleBot(room) {
-  if (room.botTimer) return; // already scheduled
+  if (room.botTimer) return;
   const seatIdx = room.currentPlayer;
   const p = room.players[seatIdx];
   if (!p?.isBot || room.phase !== 'playing') return;
@@ -185,6 +218,13 @@ function scheduleBot(room) {
 
     const hand = room.hands[seatIdx];
     if (!hand?.length) return;
+
+    // FIX: If bot owns the table (everyone else passed), clear it first
+    if (room.table && room.table.playedBy === seatIdx) {
+      room.table = null;
+      room.passStreak = 0;
+      room.log.push('— Стол очищен —');
+    }
 
     if (!room.table) {
       // Play lowest single card
@@ -197,26 +237,19 @@ function scheduleBot(room) {
       if (room.hands[seatIdx].length === 0) {
         room.finished.push(seatIdx);
         room.log.push(`${p.name} вышел`);
-        const active = [0,1,2,3].filter(i => !room.finished.includes(i));
-        if (active.length <= 1) {
-          room.phase = 'finished';
-          room.log.push('🏆 Партия окончена!');
-          if (room.finished.length > 0) room.wins[room.finished[0]]++;
-          clearTurnTimer(room);
-          broadcastRoom(room);
-          return;
-        }
+        room.log = room.log.slice(-12);
+        if (checkRoundEnd(room)) { broadcastRoom(room); return; }
       }
       room.currentPlayer = nextActive(seatIdx, room.finished);
       room.passStreak = 0;
       room.log = room.log.slice(-12);
       broadcastRoom(room);
       afterTurnChange(room);
-    } else if (room.table.playedBy !== seatIdx) {
-      // Try to beat with a pair if possible, else pass
+    } else {
+      // Try to beat or pass
       let played = false;
-      const rankNeeded = room.table.combo.rank;
       if (room.table.combo.type === 'single') {
+        const rankNeeded = room.table.combo.rank;
         const candidate = hand.find(c => (VR[c.value] ?? -1) > rankNeeded && c.type === 'regular');
         if (candidate) {
           const combo = detectCombo([candidate]);
@@ -226,15 +259,8 @@ function scheduleBot(room) {
             room.log.push(`${p.name}: 1к`);
             if (room.hands[seatIdx].length === 0) {
               room.finished.push(seatIdx);
-              const active = [0,1,2,3].filter(i => !room.finished.includes(i));
-              if (active.length <= 1) {
-                room.phase = 'finished';
-                room.log.push('🏆 Партия окончена!');
-                if (room.finished.length > 0) room.wins[room.finished[0]]++;
-                clearTurnTimer(room);
-                broadcastRoom(room);
-                return;
-              }
+              room.log = room.log.slice(-12);
+              if (checkRoundEnd(room)) { broadcastRoom(room); return; }
             }
             room.currentPlayer = nextActive(seatIdx, room.finished);
             room.passStreak = 0;
@@ -246,7 +272,6 @@ function scheduleBot(room) {
         }
       }
       if (!played) {
-        // Pass
         room.log.push(`${p.name} пасует`);
         room.passStreak++;
         const active = [0,1,2,3].filter(i => !room.finished.includes(i));
@@ -261,10 +286,10 @@ function scheduleBot(room) {
   }, 1200 + Math.random() * 800);
 }
 
-// ─── ROOMS ─────────────────────────────────────────────────────────────
+// ─── ROOMS ──────────────────────────────────────────────────────────────────────────────────────────────
 const rooms = {};
 
-// ─── PERSISTENCE ─────────────────────────────────────────────────────────
+// ─── PERSISTENCE ──────────────────────────────────────────────────────────────────────────────────────────
 const ROOMS_FILE = './rooms-backup.json';
 let saveTimeout = null;
 
@@ -286,6 +311,7 @@ function loadRooms() {
     const data = JSON.parse(fs.readFileSync(ROOMS_FILE, 'utf8'));
     for (const [code, room] of Object.entries(data)) {
       room.turnTimer = null; room.botTimer = null;
+      if (!room.champion) room.champion = null;
       rooms[code] = room;
       if (room.phase === 'playing') {
         if (room.turnDeadline && room.turnDeadline > Date.now()) {
@@ -312,6 +338,7 @@ function getPublicState(room, forPlayerId) {
     phase: room.phase,
     currentPlayer: room.currentPlayer,
     turnDeadline: room.turnDeadline || null,
+    champion: room.champion ?? null,
     players: room.players.map((p, i) => ({
       id: p.id,
       name: p.name,
@@ -360,7 +387,7 @@ function startGame(room) {
   afterTurnChange(room);
 }
 
-// ─── SOCKET EVENTS ─────────────────────────────────────────────────────────
+// ─── SOCKET EVENTS ──────────────────────────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('Connected:', socket.id);
 
@@ -371,7 +398,7 @@ io.on('connection', (socket) => {
       players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', connected: true }],
       hands: [[], [], [], []], levels: [0,0,0,0], wins: [0,0,0,0],
       currentPlayer: 0, table: null, log: [], finished: [], passStreak: 0,
-      turnDeadline: null, turnTimer: null, botTimer: null,
+      turnDeadline: null, turnTimer: null, botTimer: null, champion: null,
     };
     rooms[code] = room;
     socket.join(code);
@@ -441,15 +468,19 @@ io.on('connection', (socket) => {
         else { [0,1,2,3].forEach(i => { if (i !== seatIdx && !room.finished.includes(i)) room.levels[i] = Math.max(0, room.levels[i]-1); }); room.log.push(`${pname} вышел с 4-4! Все -1 уровень`); }
       } else {
         const hasLv = selected.some(c => rvOf(c, chamVal) === getLV(room.levels[seatIdx]));
-        if (hasLv) { const oldLv = getLV(room.levels[seatIdx]); room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type); room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`); }
-        else room.log.push(`${pname} вышел (уровень без изменений)`);
+        if (hasLv) {
+          const oldLv = getLV(room.levels[seatIdx]);
+          room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type);
+          room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`);
+        } else {
+          room.log.push(`${pname} вышел (уровень без изменений)`);
+        }
       }
-      const active = [0,1,2,3].filter(i => !room.finished.includes(i));
-      if (active.length <= 1) {
-        room.phase = 'finished'; room.log.push('🏆 Партия окончена!');
-        if (room.finished.length > 0) room.wins[room.finished[0]]++;
-        clearTurnTimer(room);
-      }
+      room.table = { cards: selected, combo, playedBy: seatIdx };
+      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.passStreak = 0;
+      room.log = room.log.slice(-12);
+      if (checkRoundEnd(room)) { broadcastRoom(room); return; }
     } else {
       const myLV = getLV(room.levels[seatIdx]);
       if (selected.some(c => rvOf(c, chamVal) === myLV)) {
@@ -457,10 +488,10 @@ io.on('connection', (socket) => {
         if (left === 0) { room.levels[seatIdx] = Math.max(0, room.levels[seatIdx]-1); room.log.push(`${pname} потратил все ${myLV}! -1 уровень`); }
       }
       room.log.push(`${pname}: ${selected.length}к`);
+      room.table = { cards: selected, combo, playedBy: seatIdx };
+      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.passStreak = 0;
     }
-    room.table = { cards: selected, combo, playedBy: seatIdx };
-    room.currentPlayer = nextActive(seatIdx, room.finished);
-    room.passStreak = 0;
     room.log = room.log.slice(-12);
     if (room.phase === 'playing') afterTurnChange(room);
     broadcastRoom(room);
@@ -483,6 +514,21 @@ io.on('connection', (socket) => {
     broadcastRoom(room);
   });
 
+  // Manual table clear: only the player who owns the table can close it
+  socket.on('clearTable', ({ code }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== 'playing') return;
+    const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
+    if (seatIdx !== room.currentPlayer) return;
+    if (!room.table || room.table.playedBy !== seatIdx) return;
+    room.table = null;
+    room.passStreak = 0;
+    room.log.push('— Стол закрыт —');
+    room.log = room.log.slice(-12);
+    broadcastRoom(room);
+    afterTurnChange(room);
+  });
+
   socket.on('sendReaction', ({ code, toSeatIdx, emoji }) => {
     const room = rooms[code];
     if (!room) return;
@@ -496,6 +542,11 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'finished') return;
     const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
     if (seatIdx !== 0) return;
+    // If champion was declared, start new session: reset levels
+    if (room.champion !== null && room.champion !== undefined) {
+      room.levels = [0, 0, 0, 0];
+      room.champion = null;
+    }
     startGame(room);
     broadcastRoom(room);
   });
