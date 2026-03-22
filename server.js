@@ -12,7 +12,7 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// ─── GAME LOGIC ───────────────────────────────────────────
+// ─── GAME LOGIC ─────────────────────────────────────────────────────────
 const SUITS    = ['♠','♥','♦','♣'];
 const REG_VALS = ['4','5','6','7','8','9','10','J','Q','K','A','2','3'];
 const SEQ_BAD  = new Set(['2','3','JB','JR']);
@@ -121,7 +121,53 @@ function canBeat(played, table) {
   return false;
 }
 
-// ─── ROOMS ────────────────────────────────────────────────
+function nextActive(from, fins, total = 4) {
+  let n = (from + 1) % total, t = 0;
+  while (fins.includes(n) && t < total) { n = (n + 1) % total; t++; }
+  return n;
+}
+
+// ─── TURN TIMER ─────────────────────────────────────────────────────────
+const TURN_TIMEOUT = 30000;
+
+function startTurnTimer(room) {
+  clearTurnTimer(room);
+  room.turnDeadline = Date.now() + TURN_TIMEOUT;
+  room.turnTimer = setTimeout(() => autoPass(room), TURN_TIMEOUT);
+}
+
+function clearTurnTimer(room) {
+  if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
+  room.turnDeadline = null;
+}
+
+function autoPass(room) {
+  if (room.phase !== 'playing') return;
+  const seatIdx = room.currentPlayer;
+  const p = room.players[seatIdx];
+  if (!p) return;
+
+  if (room.table && room.table.playedBy !== seatIdx) {
+    room.passStreak++;
+    const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+    const needed = active.filter(i => i !== room.table.playedBy).length;
+    room.currentPlayer = nextActive(seatIdx, room.finished);
+    room.log.push(`${p.name} пасует (авто)`);
+    if (room.passStreak >= needed) {
+      room.table = null;
+      room.passStreak = 0;
+      room.log.push('— Стол очищен —');
+    }
+  } else {
+    room.currentPlayer = nextActive(seatIdx, room.finished);
+    room.log.push(`${p.name} пропускает ход (авто)`);
+  }
+  room.log = room.log.slice(-12);
+  broadcastRoom(room);
+  startTurnTimer(room);
+}
+
+// ─── ROOMS ─────────────────────────────────────────────────────────────
 const rooms = {};
 
 function generateCode() {
@@ -129,11 +175,11 @@ function generateCode() {
 }
 
 function getPublicState(room, forPlayerId) {
-  // Each player only sees their own cards
   return {
     roomCode: room.code,
     phase: room.phase,
     currentPlayer: room.currentPlayer,
+    turnDeadline: room.turnDeadline || null,
     players: room.players.map((p, i) => ({
       id: p.id,
       name: p.name,
@@ -142,7 +188,8 @@ function getPublicState(room, forPlayerId) {
       levelIdx: room.levels[i],
       finished: room.finished.includes(i),
       isMe: p.id === forPlayerId,
-      seatIndex: i
+      seatIndex: i,
+      connected: p.connected !== false,
     })),
     table: room.table,
     log: room.log,
@@ -181,32 +228,28 @@ function startGame(room) {
   room.passStreak = 0;
   room.phase = 'playing';
   room.log = [`${room.players[first].name} ходит первым (4♠)`];
+  startTurnTimer(room);
 }
 
-function nextActive(from, fins, total = 4) {
-  let n = (from + 1) % total, t = 0;
-  while (fins.includes(n) && t < total) { n = (n + 1) % total; t++; }
-  return n;
-}
-
-// ─── SOCKET EVENTS ────────────────────────────────────────
+// ─── SOCKET EVENTS ─────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('Connected:', socket.id);
 
-  // Create room
   socket.on('createRoom', ({ playerName }) => {
     const code = generateCode();
     const room = {
       code,
       phase: 'waiting',
-      players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1' }],
+      players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', connected: true }],
       hands: [[], [], [], []],
       levels: [0, 0, 0, 0],
       currentPlayer: 0,
       table: null,
       log: [],
       finished: [],
-      passStreak: 0
+      passStreak: 0,
+      turnDeadline: null,
+      turnTimer: null,
     };
     rooms[code] = room;
     socket.join(code);
@@ -214,7 +257,6 @@ io.on('connection', (socket) => {
     broadcastRoom(room);
   });
 
-  // Join room
   socket.on('joinRoom', ({ code, playerName }) => {
     const room = rooms[code.toUpperCase()];
     if (!room) { socket.emit('error', 'Комната не найдена'); return; }
@@ -224,31 +266,32 @@ io.on('connection', (socket) => {
     const seatIdx = room.players.length;
     room.players.push({
       id: socket.id, socketId: socket.id,
-      name: playerName || `Игрок ${seatIdx + 1}`
+      name: playerName || `Игрок ${seatIdx + 1}`,
+      connected: true,
     });
     socket.join(code.toUpperCase());
     broadcastRoom(room);
 
-    // Auto-start when 4 players joined
     if (room.players.length === 4) {
       startGame(room);
       broadcastRoom(room);
     }
   });
 
-  // Rejoin (reconnect)
   socket.on('rejoinRoom', ({ code, playerId }) => {
     const room = rooms[code];
     if (!room) { socket.emit('error', 'Комната не найдена'); return; }
     const p = room.players.find(p => p.id === playerId);
     if (p) {
       p.socketId = socket.id;
+      p.connected = true;
       socket.join(code);
-      socket.emit('gameState', getPublicState(room, playerId));
+      room.log.push(`${p.name} переподключился`);
+      room.log = room.log.slice(-12);
+      broadcastRoom(room);
     }
   });
 
-  // Play cards
   socket.on('playCards', ({ code, cardIds, chamVal }) => {
     const room = rooms[code];
     if (!room || room.phase !== 'playing') return;
@@ -264,7 +307,6 @@ io.on('connection', (socket) => {
     if (!combo) return;
     if (room.table && !canBeat(combo, room.table.combo)) return;
 
-    // Remove cards from hand
     room.hands[seatIdx] = hand.filter(c => !cardIds.includes(c.id));
     const pname = room.players[seatIdx].name;
 
@@ -296,6 +338,7 @@ io.on('connection', (socket) => {
       if (active.length <= 1) {
         room.phase = 'finished';
         room.log.push('🏆 Партия окончена!');
+        clearTurnTimer(room);
       }
     } else {
       const myLV = getLV(room.levels[seatIdx]);
@@ -313,10 +356,10 @@ io.on('connection', (socket) => {
     room.currentPlayer = nextActive(seatIdx, room.finished);
     room.passStreak = 0;
     room.log = room.log.slice(-12);
+    if (room.phase === 'playing') startTurnTimer(room);
     broadcastRoom(room);
   });
 
-  // Pass
   socket.on('pass', ({ code }) => {
     const room = rooms[code];
     if (!room || room.phase !== 'playing') return;
@@ -336,21 +379,32 @@ io.on('connection', (socket) => {
       room.log.push('— Стол очищен —');
     }
     room.log = room.log.slice(-12);
+    startTurnTimer(room);
     broadcastRoom(room);
   });
 
-  // New game (keep levels)
   socket.on('newGame', ({ code }) => {
     const room = rooms[code];
     if (!room || room.phase !== 'finished') return;
     const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
-    if (seatIdx !== 0) return; // only host can start new game
+    if (seatIdx !== 0) return;
     startGame(room);
     broadcastRoom(room);
   });
 
   socket.on('disconnect', () => {
     console.log('Disconnected:', socket.id);
+    for (const code of Object.keys(rooms)) {
+      const room = rooms[code];
+      const p = room.players.find(p => p.socketId === socket.id);
+      if (p) {
+        p.connected = false;
+        room.log.push(`⚠️ ${p.name} отключился`);
+        room.log = room.log.slice(-12);
+        broadcastRoom(room);
+        break;
+      }
+    }
   });
 });
 
