@@ -122,7 +122,7 @@ function canBeat(played, table) {
   return false;
 }
 
-function nextActive(from, fins, total = 4) {
+function nextActive(from, fins, total) {
   let n = (from + 1) % total, t = 0;
   while (fins.includes(n) && t < total) { n = (n + 1) % total; t++; }
   return n;
@@ -130,7 +130,35 @@ function nextActive(from, fins, total = 4) {
 
 // ─── ROUND END HELPER ─────────────────────────────────────────────────────────────────────────────────
 function checkRoundEnd(room) {
-  const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+  const total = room.playerCount;
+  const active = [];
+  for (let i = 0; i < total; i++) { if (!room.finished.includes(i)) active.push(i); }
+
+  if (room.gameMode === 'streak3') {
+    // Streak mode: first to finish wins the round
+    if (room.finished.length >= 1) {
+      const winner = room.finished[0];
+      room.streakWins[winner] = (room.streakWins[winner] || 0) + 1;
+      // Reset others' streaks
+      for (let i = 0; i < total; i++) {
+        if (i !== winner) room.streakWins[i] = 0;
+      }
+      room.wins[winner] = (room.wins[winner] || 0) + 1;
+      room.log.push(`🔥 ${room.players[winner]?.name} побеждает! Серия: ${room.streakWins[winner]}`);
+
+      // Check if 3 wins in a row
+      if (room.streakWins[winner] >= 3) {
+        room.champion = winner;
+        room.log.push(`🏆 ${room.players[winner]?.name} — ЧЕМПИОН! 3 победы подряд!`);
+      }
+      room.phase = 'finished';
+      clearTurnTimer(room);
+      return true;
+    }
+    return false;
+  }
+
+  // Classic mode
   if (!room.champion) {
     const champIdx = room.levels.findIndex(l => l >= MAX_LEVEL);
     if (champIdx !== -1) {
@@ -175,11 +203,11 @@ function afterTurnChange(room) {
 
 function autoPass(room) {
   if (room.phase !== 'playing') return;
+  const total = room.playerCount;
   const seatIdx = room.currentPlayer;
   const p = room.players[seatIdx];
   if (!p) return;
 
-  // Auto-close bot session if human player goes AFK (2+ consecutive auto-passes)
   const hasBots = room.players.some(pl => pl.isBot);
   if (hasBots && !p.isBot) {
     room.afkStreak = (room.afkStreak || 0) + 1;
@@ -197,16 +225,17 @@ function autoPass(room) {
 
   if (room.table && room.table.playedBy !== seatIdx) {
     room.passStreak++;
-    const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+    const active = [];
+    for (let i = 0; i < total; i++) { if (!room.finished.includes(i)) active.push(i); }
     const needed = active.filter(i => i !== room.table.playedBy).length;
-    room.currentPlayer = nextActive(seatIdx, room.finished);
+    room.currentPlayer = nextActive(seatIdx, room.finished, total);
     room.log.push(`${p.name} пасует (авто)`);
     if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
   } else {
     if (room.table && room.table.playedBy === seatIdx) {
       room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —');
     }
-    room.currentPlayer = nextActive(seatIdx, room.finished);
+    room.currentPlayer = nextActive(seatIdx, room.finished, total);
     room.log.push(`${p.name} пропускает ход (авто)`);
   }
   room.log = room.log.slice(-12);
@@ -215,10 +244,11 @@ function autoPass(room) {
 }
 
 // ─── BOT LOGIC ──────────────────────────────────────────────────────────────────────────────────────────
-const BOT_NAMES = ['Алибек 🤖', 'Даурен 🤖', 'Санжар 🤖'];
+const BOT_NAMES = ['Алибек 🤖', 'Даурен 🤖', 'Санжар 🤖', 'Нурлан 🤖', 'Бауржан 🤖'];
 
 function scheduleBot(room) {
   if (room.botTimer) return;
+  const total = room.playerCount;
   const seatIdx = room.currentPlayer;
   const p = room.players[seatIdx];
   if (!p?.isBot || room.phase !== 'playing') return;
@@ -230,7 +260,6 @@ function scheduleBot(room) {
     const hand = room.hands[seatIdx];
     if (!hand?.length) return;
 
-    // If bot owns the table (everyone passed), clear it first
     if (room.table && room.table.playedBy === seatIdx) {
       room.table = null;
       room.passStreak = 0;
@@ -250,7 +279,7 @@ function scheduleBot(room) {
         room.log = room.log.slice(-12);
         if (checkRoundEnd(room)) { broadcastRoom(room); return; }
       }
-      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.currentPlayer = nextActive(seatIdx, room.finished, total);
       room.passStreak = 0;
       room.log = room.log.slice(-12);
       broadcastRoom(room);
@@ -271,7 +300,7 @@ function scheduleBot(room) {
               room.log = room.log.slice(-12);
               if (checkRoundEnd(room)) { broadcastRoom(room); return; }
             }
-            room.currentPlayer = nextActive(seatIdx, room.finished);
+            room.currentPlayer = nextActive(seatIdx, room.finished, total);
             room.passStreak = 0;
             room.log = room.log.slice(-12);
             broadcastRoom(room);
@@ -283,9 +312,10 @@ function scheduleBot(room) {
       if (!played) {
         room.log.push(`${p.name} пасует`);
         room.passStreak++;
-        const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+        const active = [];
+        for (let i = 0; i < total; i++) { if (!room.finished.includes(i)) active.push(i); }
         const needed = active.filter(i => i !== room.table.playedBy).length;
-        room.currentPlayer = nextActive(seatIdx, room.finished);
+        room.currentPlayer = nextActive(seatIdx, room.finished, total);
         if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
         room.log = room.log.slice(-12);
         broadcastRoom(room);
@@ -322,6 +352,11 @@ function loadRooms() {
       room.turnTimer = null; room.botTimer = null;
       if (!room.champion) room.champion = null;
       if (!room.afkStreak) room.afkStreak = 0;
+      if (!room.gameMode) room.gameMode = 'classic';
+      if (!room.playerCount) room.playerCount = room.players?.length || 4;
+      if (!room.maxPlayers) room.maxPlayers = room.playerCount;
+      if (!room.streakWins) room.streakWins = new Array(room.playerCount).fill(0);
+      if (!room.dealerIdx) room.dealerIdx = 0;
       rooms[code] = room;
       if (room.phase === 'playing') {
         if (room.turnDeadline && room.turnDeadline > Date.now()) {
@@ -343,6 +378,7 @@ function generateCode() {
 }
 
 function getPublicState(room, forPlayerId) {
+  const total = room.playerCount;
   return {
     roomCode: room.code,
     phase: room.phase,
@@ -350,18 +386,22 @@ function getPublicState(room, forPlayerId) {
     turnDeadline: room.turnDeadline || null,
     champion: room.champion ?? null,
     abandoned: room.abandoned || false,
+    gameMode: room.gameMode || 'classic',
+    playerCount: total,
+    maxPlayers: room.maxPlayers || total,
     players: room.players.map((p, i) => ({
       id: p.id,
       name: p.name,
       cardCount: (room.hands[i] || []).length,
-      level: getLV(room.levels[i]),
-      levelIdx: room.levels[i],
+      level: getLV(room.levels[i] || 0),
+      levelIdx: room.levels[i] || 0,
       finished: room.finished.includes(i),
       isMe: p.id === forPlayerId,
       seatIndex: i,
       connected: p.connected !== false,
       wins: room.wins?.[i] || 0,
       isBot: p.isBot || false,
+      streakWins: room.streakWins?.[i] || 0,
     })),
     table: room.table,
     log: room.log,
@@ -383,11 +423,18 @@ function broadcastRoom(room) {
 }
 
 function startGame(room) {
+  const total = room.playerCount;
   const deck = shuffle(createDeck());
-  const hands = [[], [], [], []];
-  deck.forEach((c, i) => hands[i % 4].push(c));
+  const hands = [];
+  for (let i = 0; i < total; i++) hands.push([]);
+  // Deal cards round-robin starting from dealer
+  const dealer = room.dealerIdx || 0;
+  deck.forEach((c, i) => hands[(dealer + i) % total].push(c));
+  // Rotate dealer for next round
+  room.dealerIdx = (dealer + 1) % total;
+
   let first = 0;
-  for (let i = 0; i < 4; i++) { if (hands[i].some(c => c.isSpade4)) { first = i; break; } }
+  for (let i = 0; i < total; i++) { if (hands[i].some(c => c.isSpade4)) { first = i; break; } }
   room.hands = hands;
   room.currentPlayer = first;
   room.table = null;
@@ -404,15 +451,20 @@ function startGame(room) {
 io.on('connection', (socket) => {
   console.log('Connected:', socket.id);
 
-  socket.on('createRoom', ({ playerName }) => {
+  socket.on('createRoom', ({ playerName, gameMode, maxPlayers }) => {
     const code = generateCode();
+    const mode = (gameMode === 'streak3') ? 'streak3' : 'classic';
+    const max = Math.max(3, Math.min(6, parseInt(maxPlayers) || 4));
     const room = {
       code, phase: 'waiting',
+      gameMode: mode,
+      maxPlayers: max,
+      playerCount: 0, // will be set when game starts
       players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', connected: true }],
-      hands: [[], [], [], []], levels: [0,0,0,0], wins: [0,0,0,0],
+      hands: [], levels: [], wins: [], streakWins: [],
       currentPlayer: 0, table: null, log: [], finished: [], passStreak: 0,
       turnDeadline: null, turnTimer: null, botTimer: null, champion: null,
-      afkStreak: 0, abandoned: false,
+      afkStreak: 0, abandoned: false, dealerIdx: 0,
     };
     rooms[code] = room;
     socket.join(code);
@@ -424,12 +476,27 @@ io.on('connection', (socket) => {
     const room = rooms[code.toUpperCase()];
     if (!room) { socket.emit('error', 'Комната не найдена'); return; }
     if (room.phase !== 'waiting') { socket.emit('error', 'Игра уже началась'); return; }
-    if (room.players.length >= 4) { socket.emit('error', 'Комната заполнена'); return; }
+    if (room.players.length >= room.maxPlayers) { socket.emit('error', 'Комната заполнена'); return; }
     const seatIdx = room.players.length;
     room.players.push({ id: socket.id, socketId: socket.id, name: playerName || `Игрок ${seatIdx+1}`, connected: true });
     socket.join(code.toUpperCase());
     broadcastRoom(room);
-    if (room.players.length === 4) { startGame(room); broadcastRoom(room); }
+  });
+
+  socket.on('startGame', ({ code }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== 'waiting') return;
+    if (room.players[0]?.socketId !== socket.id) return; // only host
+    if (room.players.length < 3) { socket.emit('error', 'Минимум 3 игрока'); return; }
+    const total = room.players.length;
+    room.playerCount = total;
+    room.levels = new Array(total).fill(0);
+    room.wins = new Array(total).fill(0);
+    room.streakWins = new Array(total).fill(0);
+    room.hands = [];
+    for (let i = 0; i < total; i++) room.hands.push([]);
+    startGame(room);
+    broadcastRoom(room);
   });
 
   socket.on('fillWithBots', ({ code }) => {
@@ -437,10 +504,17 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'waiting') return;
     if (room.players[0]?.socketId !== socket.id) return;
     let bi = 0;
-    while (room.players.length < 4) {
+    while (room.players.length < room.maxPlayers) {
       room.players.push({ id: `bot_${Date.now()}_${bi}`, socketId: null, name: BOT_NAMES[bi] || `Бот ${bi+1}`, connected: true, isBot: true });
       bi++;
     }
+    const total = room.players.length;
+    room.playerCount = total;
+    room.levels = new Array(total).fill(0);
+    room.wins = new Array(total).fill(0);
+    room.streakWins = new Array(total).fill(0);
+    room.hands = [];
+    for (let i = 0; i < total; i++) room.hands.push([]);
     startGame(room);
     broadcastRoom(room);
   });
@@ -451,7 +525,7 @@ io.on('connection', (socket) => {
     const p = room.players.find(p => p.id === playerId);
     if (p) {
       p.socketId = socket.id; p.connected = true;
-      room.afkStreak = 0; // reset AFK on reconnect
+      room.afkStreak = 0;
       socket.join(code);
       room.log.push(`${p.name} переподключился`);
       room.log = room.log.slice(-12);
@@ -462,6 +536,7 @@ io.on('connection', (socket) => {
   socket.on('playCards', ({ code, cardIds, chamVal }) => {
     const room = rooms[code];
     if (!room || room.phase !== 'playing') return;
+    const total = room.playerCount;
     const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
     if (seatIdx !== room.currentPlayer) return;
     const hand = room.hands[seatIdx];
@@ -472,40 +547,53 @@ io.on('connection', (socket) => {
     if (!combo) return;
     if (room.table && !canBeat(combo, room.table.combo)) return;
 
-    room.afkStreak = 0; // player is active
+    room.afkStreak = 0;
     room.hands[seatIdx] = hand.filter(c => !cardIds.includes(c.id));
     const pname = room.players[seatIdx].name;
 
     if (room.hands[seatIdx].length === 0) {
       room.finished.push(seatIdx);
-      const is44 = combo.type === 'pair' && selected.every(c => rvOf(c, chamVal) === '4');
-      if (is44) {
-        if (room.levels[seatIdx] === 0) { room.levels[seatIdx] = 2; room.log.push(`${pname} вышел с 4-4! → уровень 6`); }
-        else { [0,1,2,3].forEach(i => { if (i !== seatIdx && !room.finished.includes(i)) room.levels[i] = Math.max(0, room.levels[i]-1); }); room.log.push(`${pname} вышел с 4-4! Все -1 уровень`); }
+
+      if (room.gameMode === 'streak3') {
+        // Streak mode: just finish, no level logic
+        room.log.push(`${pname} сбросил все карты!`);
       } else {
-        const hasLv = selected.some(c => rvOf(c, chamVal) === getLV(room.levels[seatIdx]));
-        if (hasLv) {
-          const oldLv = getLV(room.levels[seatIdx]);
-          room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type);
-          room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`);
+        // Classic mode: level logic
+        const is44 = combo.type === 'pair' && selected.every(c => rvOf(c, chamVal) === '4');
+        if (is44) {
+          if (room.levels[seatIdx] === 0) { room.levels[seatIdx] = 2; room.log.push(`${pname} вышел с 4-4! → уровень 6`); }
+          else {
+            for (let i = 0; i < total; i++) { if (i !== seatIdx && !room.finished.includes(i)) room.levels[i] = Math.max(0, room.levels[i]-1); }
+            room.log.push(`${pname} вышел с 4-4! Все -1 уровень`);
+          }
         } else {
-          room.log.push(`${pname} вышел (уровень без изменений)`);
+          const hasLv = selected.some(c => rvOf(c, chamVal) === getLV(room.levels[seatIdx]));
+          if (hasLv) {
+            const oldLv = getLV(room.levels[seatIdx]);
+            room.levels[seatIdx] = advLV(room.levels[seatIdx], combo.type);
+            room.log.push(`${pname} вышел с ${oldLv}! → ${getLV(room.levels[seatIdx])}`);
+          } else {
+            room.log.push(`${pname} вышел (уровень без изменений)`);
+          }
         }
       }
+
       room.table = { cards: selected, combo, playedBy: seatIdx };
-      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.currentPlayer = nextActive(seatIdx, room.finished, total);
       room.passStreak = 0;
       room.log = room.log.slice(-12);
       if (checkRoundEnd(room)) { broadcastRoom(room); return; }
     } else {
-      const myLV = getLV(room.levels[seatIdx]);
-      if (selected.some(c => rvOf(c, chamVal) === myLV)) {
-        const left = room.hands[seatIdx].filter(c => c.value === myLV && c.type === 'regular').length;
-        if (left === 0) { room.levels[seatIdx] = Math.max(0, room.levels[seatIdx]-1); room.log.push(`${pname} потратил все ${myLV}! -1 уровень`); }
+      if (room.gameMode === 'classic') {
+        const myLV = getLV(room.levels[seatIdx]);
+        if (selected.some(c => rvOf(c, chamVal) === myLV)) {
+          const left = room.hands[seatIdx].filter(c => c.value === myLV && c.type === 'regular').length;
+          if (left === 0) { room.levels[seatIdx] = Math.max(0, room.levels[seatIdx]-1); room.log.push(`${pname} потратил все ${myLV}! -1 уровень`); }
+        }
       }
       room.log.push(`${pname}: ${selected.length}к`);
       room.table = { cards: selected, combo, playedBy: seatIdx };
-      room.currentPlayer = nextActive(seatIdx, room.finished);
+      room.currentPlayer = nextActive(seatIdx, room.finished, total);
       room.passStreak = 0;
     }
     room.log = room.log.slice(-12);
@@ -516,15 +604,17 @@ io.on('connection', (socket) => {
   socket.on('pass', ({ code }) => {
     const room = rooms[code];
     if (!room || room.phase !== 'playing') return;
+    const total = room.playerCount;
     const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
     if (seatIdx !== room.currentPlayer) return;
     if (!room.table || room.table.playedBy === seatIdx) return;
-    room.afkStreak = 0; // player is active
+    room.afkStreak = 0;
     room.log.push(`${room.players[seatIdx].name} пасует`);
     room.passStreak++;
-    const active = [0,1,2,3].filter(i => !room.finished.includes(i));
+    const active = [];
+    for (let i = 0; i < total; i++) { if (!room.finished.includes(i)) active.push(i); }
     const needed = room.table ? active.filter(i => i !== room.table.playedBy).length : 0;
-    room.currentPlayer = nextActive(seatIdx, room.finished);
+    room.currentPlayer = nextActive(seatIdx, room.finished, total);
     if (room.passStreak >= needed) { room.table = null; room.passStreak = 0; room.log.push('— Стол очищен —'); }
     room.log = room.log.slice(-12);
     afterTurnChange(room);
@@ -559,9 +649,21 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'finished') return;
     const seatIdx = room.players.findIndex(p => p.socketId === socket.id);
     if (seatIdx !== 0) return;
-    if (room.champion !== null && room.champion !== undefined) {
-      room.levels = [0, 0, 0, 0];
-      room.champion = null;
+
+    if (room.gameMode === 'streak3') {
+      if (room.champion !== null && room.champion !== undefined) {
+        // Champion found — reset everything for new session
+        room.streakWins = new Array(room.playerCount).fill(0);
+        room.wins = new Array(room.playerCount).fill(0);
+        room.champion = null;
+      }
+      // Otherwise just start next round (streaks persist)
+    } else {
+      // Classic mode
+      if (room.champion !== null && room.champion !== undefined) {
+        room.levels = new Array(room.playerCount).fill(0);
+        room.champion = null;
+      }
     }
     startGame(room);
     broadcastRoom(room);
