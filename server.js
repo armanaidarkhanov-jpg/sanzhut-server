@@ -377,6 +377,12 @@ function generateCode() {
   return Math.random().toString(36).substr(2, 5).toUpperCase();
 }
 
+// Only accept https avatar links from Telegram (photo_url in WebApp initData)
+function safePhoto(url) {
+  if (typeof url !== 'string' || url.length > 400) return null;
+  return /^https:\/\/(t\.me|[a-z0-9.-]*telegram\.org|[a-z0-9.-]*telesco\.pe)\//i.test(url) ? url : null;
+}
+
 function getPublicState(room, forPlayerId) {
   const total = room.playerCount;
   return {
@@ -392,6 +398,7 @@ function getPublicState(room, forPlayerId) {
     players: room.players.map((p, i) => ({
       id: p.id,
       name: p.name,
+      photo: p.photo || null,
       cardCount: (room.hands[i] || []).length,
       level: getLV(room.levels[i] || 0),
       levelIdx: room.levels[i] || 0,
@@ -451,7 +458,7 @@ function startGame(room) {
 io.on('connection', (socket) => {
   console.log('Connected:', socket.id);
 
-  socket.on('createRoom', ({ playerName, gameMode, maxPlayers }) => {
+  socket.on('createRoom', ({ playerName, gameMode, maxPlayers, photo }) => {
     const code = generateCode();
     const mode = (gameMode === 'streak3') ? 'streak3' : 'classic';
     const max = Math.max(3, Math.min(6, parseInt(maxPlayers) || 4));
@@ -460,7 +467,7 @@ io.on('connection', (socket) => {
       gameMode: mode,
       maxPlayers: max,
       playerCount: 0, // will be set when game starts
-      players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', connected: true }],
+      players: [{ id: socket.id, socketId: socket.id, name: playerName || 'Игрок 1', photo: safePhoto(photo), connected: true }],
       hands: [], levels: [], wins: [], streakWins: [],
       currentPlayer: 0, table: null, log: [], finished: [], passStreak: 0,
       turnDeadline: null, turnTimer: null, botTimer: null, champion: null,
@@ -472,13 +479,13 @@ io.on('connection', (socket) => {
     broadcastRoom(room);
   });
 
-  socket.on('joinRoom', ({ code, playerName }) => {
+  socket.on('joinRoom', ({ code, playerName, photo }) => {
     const room = rooms[code.toUpperCase()];
     if (!room) { socket.emit('error', 'Комната не найдена'); return; }
     if (room.phase !== 'waiting') { socket.emit('error', 'Игра уже началась'); return; }
     if (room.players.length >= room.maxPlayers) { socket.emit('error', 'Комната заполнена'); return; }
     const seatIdx = room.players.length;
-    room.players.push({ id: socket.id, socketId: socket.id, name: playerName || `Игрок ${seatIdx+1}`, connected: true });
+    room.players.push({ id: socket.id, socketId: socket.id, name: playerName || `Игрок ${seatIdx+1}`, photo: safePhoto(photo), connected: true });
     socket.join(code.toUpperCase());
     broadcastRoom(room);
   });
